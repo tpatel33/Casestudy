@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .retrieval import EvidenceMatch, find_supporting_note
+from .retrieval import CATEGORY_BY_NOTE, EvidenceMatch, find_supporting_note
 
 OUTPUT_COLUMNS = (
     "route",
@@ -135,6 +135,7 @@ def build_reports(
                 "peer_baseline": row["peer_baseline"],
                 "matched_note_id": evidence.note_id if evidence else "",
                 "evidence_validated": evidence is not None,
+                "evidence_category": CATEGORY_BY_NOTE.get(evidence.note_id, "—") if evidence else "—",
                 "evidence_scope": "route-specific" if evidence and evidence.supports_peer_relative else ("all-routes-history" if evidence else ""),
             }
         )

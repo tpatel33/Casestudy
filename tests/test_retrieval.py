@@ -50,6 +50,19 @@ def test_out_of_window_note_is_rejected() -> None:
     assert match is None
 
 
+def test_wrong_route_note_is_rejected() -> None:
+    notes = load_context_notes(NOTES)
+
+    match = find_supporting_note(
+        notes,
+        route="Mumbai-Pune",
+        week_of=pd.Timestamp("2025-01-20"),
+        trigger_baselines="own_history",
+    )
+
+    assert match is None
+
+
 def test_unaffected_note_is_rejected() -> None:
     notes = load_context_notes(NOTES)
 

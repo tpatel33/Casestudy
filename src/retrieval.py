@@ -13,6 +13,11 @@ import pandas as pd
 
 
 NOTE_COLUMNS = ("note_id", "date", "applies_to", "note")
+CATEGORY_BY_NOTE = {
+    "N001": "weather/flood",
+    "N002": "festival surcharge",
+    "N003": "fuel",
+}
 UNSUPPORTED_PATTERNS = (
     "not significantly affected",
     "no major disruptions",
@@ -47,6 +52,20 @@ class EvidenceMatch:
     applies_to: str
     note: str
     supports_peer_relative: bool
+
+
+@dataclass(frozen=True)
+class NoteAssessment:
+    """Auditable applicability checks for one note and one route-week query."""
+
+    note_id: str
+    applies_to: str
+    route_applicable: bool
+    date_applicable: bool
+    content_supports_cost: bool
+    baseline_scope_supported: bool
+    accepted: bool
+    reason: str
 
 
 def load_context_notes(path: str | Path) -> pd.DataFrame:
@@ -121,6 +140,55 @@ def _supports_cost_impact(note: str) -> bool:
     if any(pattern in lowered for pattern in UNSUPPORTED_PATTERNS):
         return False
     return any(term in lowered for term in IMPACT_TERMS)
+
+
+def assess_notes(
+    notes: pd.DataFrame,
+    *,
+    route: str,
+    week_of: pd.Timestamp,
+    trigger_baselines: str = "own_history",
+) -> list[NoteAssessment]:
+    """Explain why each note is or is not valid for a route-week query."""
+
+    target_week = pd.Timestamp(week_of)
+    target_end = target_week + timedelta(days=6)
+    assessments: list[NoteAssessment] = []
+    needs_peer_explanation = "similar_routes" in trigger_baselines.split(",")
+    for _, note in notes.iterrows():
+        route_applicable = _route_applicable(str(note["applies_to"]), route)
+        date_applicable = bool(
+            note["effective_start"] <= target_end and note["effective_end"] >= target_week
+        )
+        content_supports_cost = _supports_cost_impact(str(note["note"]))
+        exact_route = str(note["applies_to"]).casefold() == route.casefold()
+        baseline_scope_supported = not needs_peer_explanation or exact_route
+        if not route_applicable:
+            reason = "The note applies to a different route or geography."
+        elif not date_applicable:
+            reason = "The note's effective date window does not overlap this route-week."
+        elif not content_supports_cost:
+            reason = "The note does not support an increased cost and may state that conditions were normal or unaffected."
+        elif not baseline_scope_supported:
+            reason = "A nationwide note may support general history, but cannot explain a peer-relative increase."
+        else:
+            reason = "The note matches the route, date window, cost-impact content, and requested baseline scope."
+        assessments.append(
+            NoteAssessment(
+                note_id=str(note["note_id"]),
+                applies_to=str(note["applies_to"]),
+                route_applicable=route_applicable,
+                date_applicable=date_applicable,
+                content_supports_cost=content_supports_cost,
+                baseline_scope_supported=baseline_scope_supported,
+                accepted=route_applicable
+                and date_applicable
+                and content_supports_cost
+                and baseline_scope_supported,
+                reason=reason,
+            )
+        )
+    return assessments
 
 
 def find_supporting_note(

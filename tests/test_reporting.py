@@ -57,3 +57,4 @@ def test_justified_output_has_note_id_and_grounded_reason(tmp_path: Path) -> Non
     assert written.loc[0, "matched_note_id"] == "N002"
     assert "N002" in written.loc[0, "reason"]
     assert "surcharge" in written.loc[0, "reason"].casefold()
+    assert audit.loc[0, "evidence_category"] == "festival surcharge"
