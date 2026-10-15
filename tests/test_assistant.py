@@ -54,6 +54,56 @@ def _fixtures() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return output, audit, load_context_notes(ROOT / "context_notes.csv")
 
 
+def _range_fixtures() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    output, audit, notes = _fixtures()
+    extra_output = pd.DataFrame(
+        [
+            {
+                "route": "Chennai-Bangalore",
+                "week_of": week,
+                "cost_per_tonne_km": cost,
+                "vs_own_history": "+2.0% vs this route's past average",
+                "vs_similar_routes": "+3.0% vs similar route types this week",
+                "flagged": "No",
+                "matched_note_id": "",
+                "reason": "No anomaly",
+            }
+            for week, cost in (
+                ("2024-03-04", 3.00),
+                ("2024-03-11", 3.10),
+                ("2025-03-03", 3.20),
+                ("2025-03-10", 3.30),
+                ("2025-03-31", 3.40),
+                ("2025-04-07", 3.50),
+            )
+        ]
+    )
+    extra_audit = pd.DataFrame(
+        [
+            {
+                "route": "Chennai-Bangalore",
+                "week_of": week,
+                "route_type": "Long",
+                "anomaly": False,
+                "trigger_baselines": "",
+            }
+            for week, _ in (
+                ("2024-03-04", 3.00),
+                ("2024-03-11", 3.10),
+                ("2025-03-03", 3.20),
+                ("2025-03-10", 3.30),
+                ("2025-03-31", 3.40),
+                ("2025-04-07", 3.50),
+            )
+        ]
+    )
+    return (
+        pd.concat([output, extra_output], ignore_index=True),
+        pd.concat([audit, extra_audit], ignore_index=True),
+        notes,
+    )
+
+
 def test_valid_question_cites_exact_note() -> None:
     output, audit, notes = _fixtures()
 
@@ -119,3 +169,88 @@ def test_global_lists_use_verified_rows() -> None:
 
     assert "N001" in supported.text
     assert "Mumbai-Pune" in unexplained.text
+
+
+def test_route_alias_and_first_monday_are_resolved() -> None:
+    output, audit, notes = _range_fixtures()
+
+    answer = answer_question(
+        "What was the cost on the first Monday of March 2025 for Chennai-Bengaluru?",
+        output,
+        audit,
+        notes,
+    )
+
+    assert answer.status == "not-anomaly"
+    assert answer.route == "Chennai-Bangalore"
+    assert answer.week_of == pd.Timestamp("2025-03-03")
+    assert "3.20" in answer.text
+
+
+def test_last_monday_and_month_wide_question_return_verified_rows() -> None:
+    output, audit, notes = _range_fixtures()
+
+    last = answer_question(
+        "What was the cost on the last Monday of March 2025 for Chennai-Bangalore?",
+        output,
+        audit,
+        notes,
+    )
+    month = answer_question(
+        "What were the costs for Chennai-Bangalore in March 2025?",
+        output,
+        audit,
+        notes,
+    )
+
+    assert last.week_of == pd.Timestamp("2025-03-31")
+    assert month.status == "summary"
+    assert "2025-03-03" in month.text
+    assert "2025-03-31" in month.text
+
+
+def test_ambiguous_month_year_asks_for_conversational_clarification() -> None:
+    output, audit, notes = _range_fixtures()
+
+    answer = answer_question("What were the costs for Chennai-Bangalore in March?", output, audit, notes)
+
+    assert answer.status == "clarification"
+    assert "Which year" in answer.text
+    assert "2024" in answer.text and "2025" in answer.text
+
+
+def test_month_date_range_returns_all_matching_weeks() -> None:
+    output, audit, notes = _range_fixtures()
+
+    answer = answer_question(
+        "What happened for Chennai-Bangalore from March 2025 to April 2025?",
+        output,
+        audit,
+        notes,
+    )
+
+    assert answer.status == "summary"
+    assert answer.weeks == tuple(
+        pd.to_datetime(value)
+        for value in ("2025-03-03", "2025-03-10", "2025-03-31", "2025-04-07")
+    )
+
+
+def test_follow_up_uses_previous_route_and_week_context() -> None:
+    output, audit, notes = _range_fixtures()
+    first_question = "Why did Chennai-Bangalore spike on 2025-02-24?"
+    first = answer_question(first_question, output, audit, notes)
+
+    follow_up = answer_question(
+        "What about the next week?",
+        output,
+        audit,
+        notes,
+        conversation_context=[
+            {"role": "user", "content": first_question},
+            {"role": "assistant", "content": first.text},
+        ],
+    )
+
+    assert follow_up.route == "Chennai-Bangalore"
+    assert follow_up.week_of == pd.Timestamp("2025-03-03")

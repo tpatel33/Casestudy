@@ -55,7 +55,7 @@ The template header is valid and preserved. Its third sample row is malformed CS
 
 ## Conversational analyst assistant
 
-The dashboard includes an **Ask the analyst assistant** section. It supports questions about a specific route and week, evidence-supported anomalies, unexplained anomalies, matched notes, and why a note was rejected. Route names and week dates are resolved against the computed results; explanation questions prioritize anomalous route-weeks, while ambiguous requests receive a clarification instead of a guess.
+The dashboard includes an **Ask the analyst assistant** section. It supports natural-language questions about routes, cost spikes, evidence-supported anomalies, unexplained anomalies, matched notes, and rejected notes. It understands month names, first or last Mondays, date ranges, route aliases such as Bengaluru/Bangalore, and verified follow-up questions from the current chat. Ambiguous years receive a conversational clarification instead of a guess.
 
 Answers are first resolved deterministically using only `flags.csv`, `audit.csv`, and `context_notes.csv`. Evidence-supported answers cite the exact note ID and effective date window. Unexplained increases explicitly say that the supplied evidence cannot confirm a cause.
 
@@ -65,7 +65,7 @@ Gemini configuration can be supplied through environment variables or Streamlit 
 
 ```text
 GEMINI_API_KEY=your-key-in-a-secret-store
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.5-flash-lite
 GEMINI_TIMEOUT_SECONDS=20
 ```
 

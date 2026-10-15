@@ -222,7 +222,12 @@ question = st.chat_input("Ask about a route, week, anomaly, or evidence note")
 if question:
     st.session_state.assistant_messages.append({"role": "user", "content": question})
     deterministic_answer = answer_question(
-        question, output, audit, notes, gemini_config=gemini_config if use_gemini else None
+        question,
+        output,
+        audit,
+        notes,
+        gemini_config=gemini_config if use_gemini else None,
+        conversation_context=st.session_state.assistant_messages,
     )
     if deterministic_answer.usage:
         st.session_state.llm_usage_log.append(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 import re
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
 
@@ -133,7 +133,9 @@ def classify_intent(question: str) -> str:
 
     # --- Gate A: domain-signal presence ---------------------------------
     # Check first so we don't misclassify real-freight questions as gibberish.
-    has_domain_signal = any(signal in lowered for signal in _FREIGHT_SIGNALS)
+    has_domain_signal = any(signal in lowered for signal in _FREIGHT_SIGNALS) or bool(
+        re.search(r"\b[A-Za-z]+(?:-[A-Za-z]+|\s+to\s+[A-Za-z]+)\b", stripped)
+    )
 
     if not has_domain_signal:
         # No freight-related words at all.
@@ -200,6 +202,13 @@ class AssistantAnswer:
     week_of: pd.Timestamp | None = None
     note_ids: tuple[str, ...] = ()
     usage: Any | None = None
+    weeks: tuple[pd.Timestamp, ...] = ()
+
+
+@dataclass(frozen=True)
+class TimeSelection:
+    weeks: tuple[pd.Timestamp, ...] = ()
+    error: str | None = None
 
 
 
@@ -239,13 +248,22 @@ def _known_routes(results: pd.DataFrame) -> list[str]:
 
 
 def _find_route(question: str, routes: Iterable[str]) -> tuple[str | None, str | None]:
-    lowered = question.casefold()
-    for source, replacement in PLACE_ALIASES.items():
+    lowered = question.casefold().replace("–", "-").replace("—", "-")
+    for source, replacement in sorted(PLACE_ALIASES.items(), key=lambda item: -len(item[0])):
         lowered = re.sub(rf"\b{source}\b", replacement, lowered)
     known = list(routes)
     matches = [route for route in known if route.casefold() in lowered]
     if matches:
         return max(matches, key=len), None
+
+    for route in known:
+        origin, destination = (part.casefold() for part in route.split("-", 1))
+        if re.search(
+            rf"\b{re.escape(origin)}\b\s*(?:-|to|towards|/|,)\s*\b{re.escape(destination)}\b",
+            lowered,
+        ):
+            return route, None
+
     place_matches = [
         route
         for route in known
@@ -262,46 +280,174 @@ def _find_route(question: str, routes: Iterable[str]) -> tuple[str | None, str |
     return None, None
 
 
-def _find_week(question: str, route_rows: pd.DataFrame) -> tuple[pd.Timestamp | None, str | None]:
-    iso_dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", question)
-    if iso_dates:
-        target = pd.to_datetime(iso_dates[0], format="%Y-%m-%d", errors="coerce")
-        if pd.isna(target):
-            return None, "That date is not valid. Please provide a Monday week date such as `2025-02-24`."
-        target = target - timedelta(days=int(target.dayofweek))
-        if target in set(route_rows["week_of"]):
-            return target, None
-        return None, f"I found no computed route-week record for week `{target:%Y-%m-%d}`."
+def _month_mentions(question: str) -> list[tuple[int, int, int]]:
+    names = sorted({*MONTHS, *MONTH_ALIASES}, key=len, reverse=True)
+    pattern = r"\b(" + "|".join(re.escape(name) for name in names) + r")\b"
+    return [
+        (MONTHS.get(match.group(1), MONTH_ALIASES.get(match.group(1))), match.start(), match.end())
+        for match in re.finditer(pattern, question.casefold())
+    ]
+
+
+def _available_weeks(route_rows: pd.DataFrame) -> tuple[pd.Timestamp, ...]:
+    return tuple(sorted(pd.Timestamp(value) for value in route_rows["week_of"].dropna().unique()))
+
+
+def _year_options(route_rows: pd.DataFrame, month_number: int) -> list[int]:
+    weeks = pd.to_datetime(route_rows["week_of"], errors="coerce")
+    return sorted(weeks[weeks.dt.month.eq(month_number)].dt.year.dropna().astype(int).unique())
+
+
+def _year_clarification(month_number: int, years: Sequence[int]) -> str:
+    month_name = pd.Timestamp(year=2000, month=month_number, day=1).strftime("%B")
+    joined = ", ".join(str(year) for year in years)
+    return f"I found {month_name} in {joined}. Which year should I inspect?"
+
+
+def _normalise_week(value: object) -> pd.Timestamp | None:
+    target = pd.to_datetime(value, errors="coerce")
+    if pd.isna(target):
+        return None
+    return pd.Timestamp(target) - timedelta(days=int(pd.Timestamp(target).dayofweek))
+
+
+def _month_weeks(route_rows: pd.DataFrame, month_number: int, year: int | None) -> tuple[pd.Timestamp, ...]:
+    weeks = pd.to_datetime(route_rows["week_of"], errors="coerce")
+    mask = weeks.dt.month.eq(month_number)
+    if year is not None:
+        mask &= weeks.dt.year.eq(year)
+    return tuple(sorted(pd.Timestamp(value) for value in weeks[mask].unique()))
+
+
+def _selection_from_weeks(
+    weeks: Iterable[pd.Timestamp],
+    route_rows: pd.DataFrame,
+    description: str,
+) -> TimeSelection:
+    available = set(_available_weeks(route_rows))
+    selected = tuple(sorted({pd.Timestamp(week) for week in weeks if pd.Timestamp(week) in available}))
+    if selected:
+        return TimeSelection(selected)
+    return TimeSelection(error=f"I found no computed route-week record for {description}.")
+
+
+def _find_time_selection(
+    question: str,
+    route_rows: pd.DataFrame,
+    *,
+    previous_week: pd.Timestamp | None = None,
+) -> TimeSelection:
+    """Resolve a natural-language time expression to verified route weeks."""
 
     lowered = question.casefold()
+    available = _available_weeks(route_rows)
+    if not available:
+        return TimeSelection(error="There are no computed weeks for this route.")
+
+    if re.search(r"\b(next|following)\s+week\b", lowered) or re.search(r"\bweek\s+after\b", lowered):
+        if previous_week is None:
+            return TimeSelection(error="Which earlier week should I use as the reference for the next week?")
+        return _selection_from_weeks(
+            [previous_week + timedelta(days=7)], route_rows, "the next week in the conversation"
+        )
+    if re.search(r"\b(previous|prior)\s+week\b", lowered) or re.search(r"\bweek\s+before\b", lowered):
+        if previous_week is None:
+            return TimeSelection(error="Which earlier week should I use as the reference for the previous week?")
+        return _selection_from_weeks(
+            [previous_week - timedelta(days=7)], route_rows, "the previous week in the conversation"
+        )
+
+    iso_dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", question)
+    if iso_dates:
+        parsed = [_normalise_week(value) for value in iso_dates]
+        if any(value is None for value in parsed):
+            return TimeSelection(error="That date is not valid. Please provide a real date.")
+        if len(parsed) == 1:
+            return _selection_from_weeks(parsed, route_rows, f"week `{parsed[0]:%Y-%m-%d}`")
+        start, end = sorted(parsed[:2])
+        return _selection_from_weeks(
+            [week for week in available if start <= week <= end],
+            route_rows,
+            f"the range `{start:%Y-%m-%d}` to `{end:%Y-%m-%d}`",
+        )
+
     relative_match = re.search(r"\b(\d+)\s+months?\s+ago\b", lowered)
     if relative_match:
         target = pd.Timestamp.today().normalize() - pd.DateOffset(months=int(relative_match.group(1)))
-        target = target - timedelta(days=int(target.dayofweek))
-        if target in set(route_rows["week_of"]):
-            return target, None
-        return None, f"I found no computed route-week record for week `{target:%Y-%m-%d}`."
-    if re.search(r"\byesterday\b", lowered) or re.search(r"\btoday\b", lowered):
-        target = pd.Timestamp.today().normalize()
-        target = target - timedelta(days=int(target.dayofweek))
-        if target in set(route_rows["week_of"]):
-            return target, None
-        return None, f"I found no computed route-week record for this week's Monday `{target:%Y-%m-%d}`."
-    month_number = next(
-        (number for name, number in {**MONTHS, **MONTH_ALIASES}.items() if re.search(rf"\b{name}\b", lowered)),
-        None,
-    )
-    if month_number is None:
-        return None, None
-    candidates = route_rows[route_rows["week_of"].dt.month.eq(month_number)]
-    if "late" in lowered:
-        candidates = candidates[candidates["week_of"].dt.day.ge(15)]
-    if len(candidates) == 1:
-        return candidates.iloc[0]["week_of"], None
-    if len(candidates) > 1:
-        weeks = ", ".join(pd.Timestamp(value).strftime("%Y-%m-%d") for value in candidates["week_of"][:5])
+        target = _normalise_week(target)
+        return _selection_from_weeks([target], route_rows, f"week `{target:%Y-%m-%d}`")
+    if re.search(r"\byesterday\b|\btoday\b|\bthis week\b|\blast week\b", lowered):
+        target = previous_week - timedelta(days=7) if previous_week is not None and "last week" in lowered else pd.Timestamp.today().normalize()
+        target = _normalise_week(target)
+        return _selection_from_weeks([target], route_rows, f"week `{target:%Y-%m-%d}`")
+
+    mentions = _month_mentions(lowered)
+    years = [int(value) for value in re.findall(r"\b(20\d{2})\b", lowered)]
+    if len(mentions) >= 2 and re.search(r"\b(from|between|through|to|until|and)\b", lowered):
+        first_month = mentions[0][0]
+        second_month = mentions[1][0]
+        if len(set(years)) > 1:
+            first_year, second_year = years[0], years[-1]
+        elif years:
+            first_year = second_year = years[0]
+        else:
+            first_options = _year_options(route_rows, first_month)
+            second_options = _year_options(route_rows, second_month)
+            common_years = sorted(set(first_options).intersection(second_options))
+            if len(common_years) != 1:
+                return TimeSelection(error=_year_clarification(first_month, common_years or first_options or second_options))
+            first_year = second_year = common_years[0]
+        start_weeks = _month_weeks(route_rows, first_month, first_year)
+        end_weeks = _month_weeks(route_rows, second_month, second_year)
+        if not start_weeks or not end_weeks:
+            return TimeSelection(error="I found no computed route-week records for that date range.")
+        start, end = min(start_weeks), max(end_weeks)
+        return _selection_from_weeks(
+            [week for week in available if start <= week <= end],
+            route_rows,
+            f"the range `{start:%Y-%m-%d}` to `{end:%Y-%m-%d}`",
+        )
+
+    if not mentions:
+        return TimeSelection()
+
+    month_number = mentions[0][0]
+    month_year_options = _year_options(route_rows, month_number)
+    if years:
+        year = years[0]
+    elif len(month_year_options) == 1:
+        year = month_year_options[0]
+    elif len(month_year_options) > 1:
+        return TimeSelection(error=_year_clarification(month_number, month_year_options))
+    else:
+        year = None
+
+    candidates = list(_month_weeks(route_rows, month_number, year))
+    if not candidates:
+        return TimeSelection(error=f"I found no computed route-week records in {pd.Timestamp(year=2000, month=month_number, day=1):%B}.")
+
+    selector = re.search(r"\b(first|last)\s+(?:monday|week)\b", lowered)
+    if selector:
+        return TimeSelection((candidates[0] if selector.group(1) == "first" else candidates[-1],))
+    if re.search(r"\bearly\b", lowered):
+        candidates = [week for week in candidates if week.day <= 14]
+    elif re.search(r"\blate\b", lowered):
+        candidates = [week for week in candidates if week.day >= 15]
+    if not candidates:
+        return TimeSelection(error="I found no computed route-week records in that part of the month.")
+    return TimeSelection(tuple(candidates))
+
+
+def _find_week(question: str, route_rows: pd.DataFrame) -> tuple[pd.Timestamp | None, str | None]:
+    selection = _find_time_selection(question, route_rows)
+    if selection.error:
+        return None, selection.error
+    if len(selection.weeks) == 1:
+        return selection.weeks[0], None
+    if len(selection.weeks) > 1:
+        weeks = ", ".join(week.strftime("%Y-%m-%d") for week in selection.weeks[:5])
         return None, f"I found multiple matching weeks ({weeks}). Which Monday week should I inspect?"
-    return None, f"I found no computed route-week record in {month_number:02d}."
+    return None, None
 
 
 def _format_row_answer(row: pd.Series, notes: pd.DataFrame) -> AssistantAnswer:
@@ -326,19 +472,53 @@ def _format_row_answer(row: pd.Series, notes: pd.DataFrame) -> AssistantAnswer:
                 f"(applies to `{note['applies_to']}`, effective `{start}` to `{end}`): "
                 f"{note['note']}"
             )
-            return AssistantAnswer(text, "evidence-supported", route, week, (note_id,))
+            return AssistantAnswer(text, "evidence-supported", route, week, (note_id,), weeks=(week,))
     if status == "Yes":
         return AssistantAnswer(
             f"{observed}\n\n**Unexplained.** No validated context note supports this increase for the route, week, and triggered baseline. I cannot confirm a cause from the supplied evidence.",
             "unexplained",
             route,
             week,
+            weeks=(week,),
         )
     return AssistantAnswer(
         f"{observed}\n\n**No anomaly verdict.** This record is not flagged by the configured deterministic rule.",
         "not-anomaly",
         route,
         week,
+        weeks=(week,),
+    )
+
+
+def _format_rows_answer(rows: pd.DataFrame, notes: pd.DataFrame) -> AssistantAnswer:
+    """Summarise a verified month or date range without inventing causes."""
+
+    ordered = rows.sort_values("week_of")
+    route = str(ordered.iloc[0]["route"])
+    weeks = tuple(pd.Timestamp(value) for value in ordered["week_of"])
+    parts = [f"**Verified route-week results for `{route}` ({len(ordered)} weeks)**"]
+    note_ids: list[str] = []
+    statuses: set[str] = set()
+    for _, row in ordered.iterrows():
+        answer = _format_row_answer(row, notes)
+        parts.append(answer.text)
+        statuses.add(answer.status)
+        for note_id in answer.note_ids:
+            if note_id not in note_ids:
+                note_ids.append(note_id)
+    if "unexplained" in statuses:
+        status = "unexplained"
+    elif "evidence-supported" in statuses:
+        status = "evidence-supported"
+    else:
+        status = "summary"
+    return AssistantAnswer(
+        "\n\n".join(parts),
+        status,
+        route,
+        weeks[0] if len(weeks) == 1 else None,
+        tuple(note_ids),
+        weeks=weeks,
     )
 
 
@@ -392,12 +572,19 @@ def _rejection_answer(question: str, route: str, week: pd.Timestamp, notes: pd.D
             "clarification",
             route,
             week,
+            weeks=(week,),
         )
     note_id = note_ids[0]
     assessments = assess_notes(notes, route=route, week_of=week)
     matching = [assessment for assessment in assessments if assessment.note_id == note_id]
     if not matching:
-        return AssistantAnswer(f"I could not find note `{note_id}` in `context_notes.csv`.", "not-found", route, week)
+        return AssistantAnswer(
+            f"I could not find note `{note_id}` in `context_notes.csv`.",
+            "not-found",
+            route,
+            week,
+            weeks=(week,),
+        )
     assessment = matching[0]
     verdict = "accepted" if assessment.accepted else "rejected"
     return AssistantAnswer(
@@ -406,6 +593,7 @@ def _rejection_answer(question: str, route: str, week: pd.Timestamp, notes: pd.D
         route,
         week,
         (note_id,),
+        weeks=(week,),
     )
 
 
@@ -426,13 +614,13 @@ def build_grounding_context(
         "deterministic_answer": answer.text,
         "allowed_note_ids": list(answer.note_ids),
     }
-    if answer.route and answer.week_of is not None:
+    selected_weeks = answer.weeks or ((answer.week_of,) if answer.week_of is not None else ())
+    if answer.route and selected_weeks:
         row = results[
             results["route"].eq(answer.route)
-            & results["week_of"].eq(pd.Timestamp(answer.week_of))
-        ]
+            & results["week_of"].isin([pd.Timestamp(week) for week in selected_weeks])
+        ].sort_values("week_of")
         if not row.empty:
-            selected = row.iloc[0]
             fields = (
                 "route",
                 "week_of",
@@ -446,11 +634,22 @@ def build_grounding_context(
                 "trigger_baselines",
                 "evidence_category",
             )
-            context["verified_route_week"] = {
-                field: str(selected[field])
-                for field in fields
-                if field in selected and pd.notna(selected[field])
-            }
+            verified_rows = []
+            for _, selected in row.iterrows():
+                record = {}
+                for field in fields:
+                    if field not in selected or pd.isna(selected[field]):
+                        continue
+                    value = selected[field]
+                    record[field] = (
+                        pd.Timestamp(value).strftime("%Y-%m-%d")
+                        if field == "week_of"
+                        else str(value)
+                    )
+                verified_rows.append(record)
+            context["verified_route_weeks"] = verified_rows
+            if len(verified_rows) == 1:
+                context["verified_route_week"] = verified_rows[0]
     if answer.note_ids:
         selected_notes = notes[notes["note_id"].isin(answer.note_ids)]
         context["verified_notes"] = [
@@ -466,12 +665,61 @@ def build_grounding_context(
     return context
 
 
+def _conversation_reference(
+    conversation_context: Sequence[Mapping[str, str]] | None,
+    results: pd.DataFrame,
+    routes: list[str],
+) -> tuple[str | None, pd.Timestamp | None]:
+    """Recover only the last verified route/week needed for a follow-up."""
+
+    if not conversation_context:
+        return None, None
+    prior_questions = [
+        str(message.get("content", ""))
+        for message in conversation_context
+        if message.get("role") == "user" and str(message.get("content", "")).strip()
+    ]
+    if not prior_questions:
+        return None, None
+    prior_question = prior_questions[-1]
+    prior_route, _ = _find_route(prior_question, routes)
+    if prior_route is None:
+        return None, None
+    prior_rows = results[results["route"].eq(prior_route)]
+    prior_week, _ = _find_week(prior_question, prior_rows)
+    return prior_route, prior_week
+
+
+def _is_contextual_follow_up(question: str) -> bool:
+    lowered = question.casefold().strip()
+    return bool(
+        re.search(r"^(and|also|then)\b", lowered)
+        or re.search(r"\bwhat about\b|\bhow about\b", lowered)
+        or re.search(r"\b(same route|same week|that week|that route|it|there)\b", lowered)
+    )
+
+
+def _with_usage(answer: AssistantAnswer, usage: Any | None) -> AssistantAnswer:
+    if usage is None:
+        return answer
+    return AssistantAnswer(
+        answer.text,
+        answer.status,
+        answer.route,
+        answer.week_of,
+        answer.note_ids,
+        usage=usage,
+        weeks=answer.weeks,
+    )
+
+
 def answer_question(
     question: str,
     output: pd.DataFrame,
     audit: pd.DataFrame,
     notes: pd.DataFrame,
     gemini_config: Any | None = None,
+    conversation_context: Sequence[Mapping[str, str]] | None = None,
 ) -> AssistantAnswer:
     """Answer supported analyst questions using only verified local results.
 
@@ -491,13 +739,19 @@ def answer_question(
     results = _normalise_results(output, audit)
     routes = _known_routes(results)
     lowered = question.casefold()
+    prior_route, prior_week = _conversation_reference(conversation_context, results, routes)
 
     gemini_understanding = None
     if gemini_config is not None and getattr(gemini_config, "configured", False):
         try:
             from .gemini import understand_question
 
-            gemini_understanding = understand_question(question, routes, gemini_config)
+            gemini_understanding = understand_question(
+                question,
+                routes,
+                gemini_config,
+                conversation_context=conversation_context,
+            )
         except Exception:
             gemini_understanding = None
 
@@ -508,6 +762,13 @@ def answer_question(
                 intent = INTENT_INVALID
     else:
         intent = classify_intent(question)
+
+    if (
+        prior_route
+        and _is_contextual_follow_up(question)
+        and intent in {INTENT_INVALID, INTENT_UNSUPPORTED}
+    ):
+        intent = INTENT_ROUTE_INVESTIGATION
 
     understanding_usage = getattr(gemini_understanding, "usage", None)
 
@@ -538,9 +799,7 @@ def answer_question(
     if intent == INTENT_SYSTEM_OVERVIEW:
         ans = _system_overview_answer()
         if understanding_usage:
-            return AssistantAnswer(
-                ans.text, ans.status, ans.route, ans.week_of, ans.note_ids, usage=understanding_usage
-            )
+            return _with_usage(ans, understanding_usage)
         return ans
 
     # ------------------------------------------------------------------
@@ -552,9 +811,7 @@ def answer_question(
     ):
         ans = _list_answers(results, supported=True)
         if understanding_usage:
-            return AssistantAnswer(
-                ans.text, ans.status, ans.route, ans.week_of, ans.note_ids, usage=understanding_usage
-            )
+            return _with_usage(ans, understanding_usage)
         return ans
 
     if intent == INTENT_LIST_UNEXPLAINED or (
@@ -563,9 +820,7 @@ def answer_question(
     ):
         ans = _list_answers(results, supported=False)
         if understanding_usage:
-            return AssistantAnswer(
-                ans.text, ans.status, ans.route, ans.week_of, ans.note_ids, usage=understanding_usage
-            )
+            return _with_usage(ans, understanding_usage)
         return ans
 
     # ------------------------------------------------------------------
@@ -578,6 +833,8 @@ def answer_question(
         route, route_error = _find_route(question, routes)
         if route_error:
             return AssistantAnswer(route_error, "not-found", usage=understanding_usage)
+        if route is None and prior_route:
+            route = prior_route
 
     if route is None:
         # The question had freight-domain intent but no identifiable route.
@@ -591,40 +848,38 @@ def answer_question(
 
     route_rows = results[results["route"].eq(route)].sort_values("week_of")
     explanation_question = any(
-        word in lowered for word in ("why", "spike", "pricier", "expensive", "increase", "cost")
+        word in lowered for word in ("why", "spike", "pricier", "expensive", "increase", "rise", "anomal")
     )
     resolution_rows = route_rows
-    has_precise_time = bool(
+    has_exact_week_expression = bool(
         re.search(r"\b\d{4}-\d{2}-\d{2}\b", question)
         or re.search(r"\b\d+\s+months?\s+ago\b", lowered)
-        or re.search(r"\b(today|yesterday|last week|this week)\b", lowered)
+        or re.search(r"\b(today|yesterday|last week|this week|next week|previous week)\b", lowered)
     )
-    if explanation_question and not has_precise_time:
+    if explanation_question and not has_exact_week_expression:
         anomaly_rows = route_rows[route_rows["flagged"].isin(["Yes", "No (justified)"])]
         if not anomaly_rows.empty:
             resolution_rows = anomaly_rows
 
-    week = None
-    if gemini_understanding and gemini_understanding.week_iso:
-        cand_date = pd.to_datetime(gemini_understanding.week_iso, errors="coerce")
-        if pd.notna(cand_date):
-            cand_monday = cand_date - timedelta(days=int(cand_date.dayofweek))
-            if cand_monday in set(route_rows["week_of"]):
-                week = cand_monday
-
-    if week is None:
-        time_query = (
-            gemini_understanding.week_hint
-            if gemini_understanding and gemini_understanding.week_hint
-            else question
+    selection = _find_time_selection(question, resolution_rows, previous_week=prior_week)
+    if not selection.weeks and not selection.error and gemini_understanding:
+        time_hint = getattr(gemini_understanding, "time_hint", None) or getattr(
+            gemini_understanding, "week_hint", None
         )
-        week, week_error = _find_week(time_query, resolution_rows)
-        if week is None and time_query != question:
-            week, week_error = _find_week(question, resolution_rows)
-        if week_error:
-            return AssistantAnswer(week_error, "clarification", route, usage=understanding_usage)
+        if time_hint:
+            selection = _find_time_selection(time_hint, resolution_rows, previous_week=prior_week)
+        if not selection.weeks and not selection.error:
+            start = getattr(gemini_understanding, "date_start_iso", None)
+            end = getattr(gemini_understanding, "date_end_iso", None)
+            if start and end:
+                selection = _find_time_selection(f"{start} to {end}", resolution_rows, previous_week=prior_week)
+            elif getattr(gemini_understanding, "week_iso", None):
+                selection = _find_time_selection(gemini_understanding.week_iso, resolution_rows)
 
-    if week is None:
+    if selection.error:
+        return AssistantAnswer(selection.error, "clarification", route, usage=understanding_usage)
+
+    if not selection.weeks:
         return AssistantAnswer(
             "Which Monday week should I inspect? You can provide a date such as `2025-02-24`.",
             "clarification",
@@ -632,7 +887,19 @@ def answer_question(
             usage=understanding_usage,
         )
 
-    row = route_rows[route_rows["week_of"].eq(week)]
+    selected_rows = route_rows[route_rows["week_of"].isin(selection.weeks)]
+    if len(selected_rows) > 1:
+        if "reject" in lowered or ("why was" in lowered and "note" in lowered):
+            return AssistantAnswer(
+                "Which single Monday week should I use for the note rejection check?",
+                "clarification",
+                route,
+                usage=understanding_usage,
+            )
+        return _with_usage(_format_rows_answer(selected_rows, notes), understanding_usage)
+
+    week = selection.weeks[0]
+    row = selected_rows
     if row.empty:
         return AssistantAnswer(
             f"I found no computed result for `{route}` in week `{week:%Y-%m-%d}`.",
@@ -640,20 +907,14 @@ def answer_question(
             route,
             week,
             usage=understanding_usage,
+            weeks=(week,),
         )
 
     if "reject" in lowered or ("why was" in lowered and "note" in lowered):
         ans = _rejection_answer(question, route, week, notes)
         if understanding_usage:
-            return AssistantAnswer(
-                ans.text, ans.status, ans.route, ans.week_of, ans.note_ids, usage=understanding_usage
-            )
+            return _with_usage(ans, understanding_usage)
         return ans
 
     ans = _format_row_answer(row.iloc[0], notes)
-    if understanding_usage:
-        return AssistantAnswer(
-            ans.text, ans.status, ans.route, ans.week_of, ans.note_ids, usage=understanding_usage
-        )
-    return ans
-
+    return _with_usage(ans, understanding_usage)

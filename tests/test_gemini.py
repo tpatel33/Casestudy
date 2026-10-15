@@ -1,5 +1,5 @@
 from src.assistant import answer_question, build_grounding_context
-from src.gemini import GeminiConfig, validate_grounded_response
+from src.gemini import GeminiConfig, GeminiRequestError, GeminiUsage, validate_grounded_response
 
 from test_assistant import _fixtures
 
@@ -138,3 +138,25 @@ def test_answer_question_with_gemini_understanding() -> None:
     assert "Which route" not in ans.text
     assert ans.usage is not None
 
+
+def test_gemini_interpretation_failure_uses_deterministic_fallback() -> None:
+    from unittest.mock import patch
+
+    output, audit, notes = _fixtures()
+    config = GeminiConfig(api_key="mock-key", model="gemini-3.5-flash-lite")
+    usage = GeminiUsage(provider="gemini", model=config.model)
+
+    with patch(
+        "src.gemini.understand_question",
+        side_effect=GeminiRequestError("temporary network failure", usage),
+    ):
+        answer = answer_question(
+            "Why did Chennai-Bengaluru spike in late February?",
+            output,
+            audit,
+            notes,
+            gemini_config=config,
+        )
+
+    assert answer.status == "evidence-supported"
+    assert "N001" in answer.text

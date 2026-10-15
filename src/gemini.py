@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import json
 import os
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -251,12 +251,24 @@ class QuestionUnderstanding:
     route: str | None = None
     week_iso: str | None = None
     week_hint: str | None = None
+    time_hint: str | None = None
+    date_start_iso: str | None = None
+    date_end_iso: str | None = None
     valid: bool = True
     usage: GeminiUsage | None = None
 
 
-def _understanding_prompt(question: str, known_routes: list[str]) -> str:
+def _understanding_prompt(
+    question: str,
+    known_routes: list[str],
+    conversation_context: Sequence[Mapping[str, str]] | None = None,
+) -> str:
     routes_str = ", ".join(f'"{r}"' for r in known_routes)
+    recent_context = "\n".join(
+        f"{message.get('role', 'user')}: {message.get('content', '')}"
+        for message in (conversation_context or [])[-6:]
+        if message.get("content")
+    )
     return f"""You are the natural language understanding layer for a freight-cost intelligence assistant.
 
 Your task is to analyze the user's question and output a single JSON object:
@@ -265,6 +277,9 @@ Your task is to analyze the user's question and output a single JSON object:
   "route": "<exact route name from the known list, or null>",
   "week_iso": "<Monday date YYYY-MM-DD if specified or inferrable, else null>",
   "week_hint": "<the raw time phrase from the question, e.g. 'late February', or null>",
+  "time_hint": "<the complete raw date/range phrase, or null>",
+  "date_start_iso": "<start date YYYY-MM-DD for a range, or null>",
+  "date_end_iso": "<end date YYYY-MM-DD for a range, or null>",
   "valid": <true if this is a coherent freight question, false if gibberish, random characters, or complete nonsense>
 }}
 
@@ -284,8 +299,13 @@ Rules:
 - If off-topic (e.g. 'write a poem', 'who won the match'), set "intent": "unsupported_request", "valid": false, "route": null.
 - If asking about a route, match city names/aliases to known routes (e.g., 'Bombay' -> Mumbai, 'Madras' -> Chennai).
 - If the route is not in known routes but is a valid shipping question, keep intent="route_investigation" and set route to null.
-- For late February 2025, the relevant Monday date is '2025-02-24'.
+- Preserve the user's time wording in "time_hint". Include a date range only when the user explicitly asks for a range.
+- Do not guess a missing year when more than one year could match; leave dates null so the application can ask a clarification.
+- Resolve follow-up questions from the recent conversation only when the referenced route or week is clear.
 - Return ONLY the JSON object, no explanation.
+
+Recent conversation:
+{recent_context or "(none)"}
 
 User question: "{question}"
 """
@@ -295,6 +315,7 @@ def understand_question(
     question: str,
     known_routes: list[str],
     config: "GeminiConfig",
+    conversation_context: Sequence[Mapping[str, str]] | None = None,
 ) -> QuestionUnderstanding:
     """Use Gemini to naturally understand a user question and extract entities.
 
@@ -311,7 +332,10 @@ def understand_question(
     )
     payload = {
         "contents": [
-            {"role": "user", "parts": [{"text": _understanding_prompt(question, known_routes)}]}
+            {
+                "role": "user",
+                "parts": [{"text": _understanding_prompt(question, known_routes, conversation_context)}],
+            }
         ],
         "generationConfig": {
             "temperature": 0.0,
@@ -371,7 +395,9 @@ def understand_question(
         route=data.get("route") or None,
         week_iso=data.get("week_iso") or None,
         week_hint=data.get("week_hint") or None,
+        time_hint=data.get("time_hint") or None,
+        date_start_iso=data.get("date_start_iso") or None,
+        date_end_iso=data.get("date_end_iso") or None,
         valid=bool(data.get("valid", True)),
         usage=_usage_from_metadata(config.model, response_payload.get("usageMetadata")),
     )
-
